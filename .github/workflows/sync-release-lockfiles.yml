@@ -60,7 +60,7 @@ jobs:
 
       - name: Verify all six source versions
         shell: bash
-        run: node scripts/check-release-version.mjs v0.5.3-rc.1
+        run: node scripts/check-release-version.mjs source v0.5.3-rc.1 .
 
       - name: Commit synchronized lockfiles
         shell: bash
