@@ -1,0 +1,204 @@
+name: Publish Windows prerelease
+
+# Fork-local, self-contained Windows publication path. It intentionally does not
+# use the upstream credentialed release pipeline, Apple signing, updater signing,
+# or external mirror credentials. A merge that changes this workflow/version
+# publishes one manually downloadable, smoke-tested x64 NSIS prerelease.
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/publish-windows-prerelease.yml"
+      - "package.json"
+      - "src-tauri/Cargo.toml"
+      - "src-tauri/tauri.conf.json"
+      - "docs/releases/v0.5.3-rc.1.md"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-windows-v0.5.3-rc.1
+  cancel-in-progress: false
+
+env:
+  RELEASE_VERSION: 0.5.3-rc.1
+  RELEASE_TAG: v0.5.3-rc.1
+  RELEASE_NOTES: docs/releases/v0.5.3-rc.1.md
+  ASSET_NAME: Codex-App-Manager_0.5.3-rc.1_windows-x64-setup.exe
+
+jobs:
+  build-test-publish:
+    name: Build, smoke-test, and publish Windows x64
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Validate release version declarations
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $packageVersion = (Get-Content -LiteralPath package.json -Raw | ConvertFrom-Json).version
+          $tauriVersion = (Get-Content -LiteralPath src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $cargoVersionLine = Get-Content -LiteralPath src-tauri/Cargo.toml |
+            Where-Object { $_ -match '^version\s*=\s*"' } |
+            Select-Object -First 1
+          if ($cargoVersionLine -notmatch '^version\s*=\s*"([^"]+)"') {
+            throw "Could not read the package version from src-tauri/Cargo.toml"
+          }
+          $cargoVersion = $Matches[1]
+          foreach ($entry in @{
+            "package.json" = $packageVersion
+            "src-tauri/tauri.conf.json" = $tauriVersion
+            "src-tauri/Cargo.toml" = $cargoVersion
+          }.GetEnumerator()) {
+            if ($entry.Value -ne $env:RELEASE_VERSION) {
+              throw "$($entry.Key) declares $($entry.Value), expected $env:RELEASE_VERSION"
+            }
+          }
+          if (-not (Test-Path -LiteralPath $env:RELEASE_NOTES -PathType Leaf)) {
+            throw "Missing release notes: $env:RELEASE_NOTES"
+          }
+
+      - run: npm ci
+
+      - name: Build x64 NSIS installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          npm run tauri build -- --bundles nsis --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tauri NSIS build failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Locate, inspect, and smoke-test installer
+        id: package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $nsisDir = "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis"
+          $installer = Get-ChildItem -LiteralPath $nsisDir -Filter "*-setup.exe" -File |
+            Select-Object -First 1
+          if (-not $installer) {
+            throw "No *-setup.exe found under $nsisDir"
+          }
+          $mainExe = "src-tauri/target/x86_64-pc-windows-msvc/release/codex-app-manager.exe"
+          if (-not (Test-Path -LiteralPath $mainExe -PathType Leaf)) {
+            throw "Missing main executable: $mainExe"
+          }
+
+          & .\scripts\windows-pe-arch.ps1 -Path $mainExe -ExpectMachine 0x8664
+          & .\scripts\windows-pe-arch.ps1 -Path $installer.FullName
+          & .\scripts\verify-windows-authenticode.ps1 `
+            -Path $installer.FullName `
+            -Mode optional `
+            -Stage "fork-prerelease"
+          & .\scripts\windows-packaged-smoke.ps1 `
+            -Installer $installer.FullName `
+            -AuthenticodeMode optional
+
+          $outDir = Join-Path $env:RUNNER_TEMP "fork-prerelease"
+          New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+          $assetPath = Join-Path $outDir $env:ASSET_NAME
+          Copy-Item -LiteralPath $installer.FullName -Destination $assetPath -Force
+          $hash = (Get-FileHash -LiteralPath $assetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $shaPath = "$assetPath.sha256"
+          "$hash  $env:ASSET_NAME" | Set-Content -LiteralPath $shaPath -Encoding ascii -NoNewline
+
+          "asset_path=$assetPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "sha_path=$shaPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Prepared $assetPath"
+          Write-Host "SHA-256: $hash"
+
+      - name: Retain Actions artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: Codex-App-Manager-v0.5.3-rc.1-windows-x64
+          path: |
+            ${{ steps.package.outputs.asset_path }}
+            ${{ steps.package.outputs.sha_path }}
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Create or refresh fork prerelease
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSET_PATH: ${{ steps.package.outputs.asset_path }}
+          SHA_PATH: ${{ steps.package.outputs.sha_path }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null
+          $releaseExists = $LASTEXITCODE -eq 0
+
+          if ($releaseExists) {
+            gh release upload $env:RELEASE_TAG `
+              $env:ASSET_PATH `
+              $env:SHA_PATH `
+              --repo $env:GITHUB_REPOSITORY `
+              --clobber
+            if ($LASTEXITCODE -ne 0) {
+              throw "Failed to upload refreshed release assets"
+            }
+            gh release edit $env:RELEASE_TAG `
+              --repo $env:GITHUB_REPOSITORY `
+              --title "Codex App Manager v$env:RELEASE_VERSION (Windows fix RC)" `
+              --notes-file $env:RELEASE_NOTES `
+              --prerelease
+            if ($LASTEXITCODE -ne 0) {
+              throw "Failed to refresh release metadata"
+            }
+          }
+          else {
+            gh release create $env:RELEASE_TAG `
+              $env:ASSET_PATH `
+              $env:SHA_PATH `
+              --repo $env:GITHUB_REPOSITORY `
+              --target $env:GITHUB_SHA `
+              --title "Codex App Manager v$env:RELEASE_VERSION (Windows fix RC)" `
+              --notes-file $env:RELEASE_NOTES `
+              --prerelease
+            if ($LASTEXITCODE -ne 0) {
+              throw "Failed to create GitHub prerelease"
+            }
+          }
+
+      - name: Verify published download and checksum
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA256: ${{ steps.package.outputs.sha256 }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $verifyDir = Join-Path $env:RUNNER_TEMP "release-readback"
+          New-Item -ItemType Directory -Path $verifyDir -Force | Out-Null
+          gh release download $env:RELEASE_TAG `
+            --repo $env:GITHUB_REPOSITORY `
+            --pattern $env:ASSET_NAME `
+            --dir $verifyDir
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not download the published installer"
+          }
+          $download = Join-Path $verifyDir $env:ASSET_NAME
+          $actual = (Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $env:EXPECTED_SHA256) {
+            throw "Published installer checksum mismatch: expected=$env:EXPECTED_SHA256 actual=$actual"
+          }
+          $url = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:RELEASE_TAG/$env:ASSET_NAME"
+          Write-Host "Published and verified: $url"
+          Write-Host "SHA-256: $actual"
