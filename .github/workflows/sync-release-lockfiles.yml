@@ -1,0 +1,77 @@
+name: Sync v0.5.3-rc.1 lockfile versions
+
+on:
+  push:
+    branches: ["release/v0.5.3-rc.1"]
+    paths:
+      - ".github/workflows/sync-release-lockfiles.yml"
+      - "package.json"
+      - "src-tauri/Cargo.toml"
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: release/v0.5.3-rc.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Synchronize root npm lock metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+          const version = '0.5.3-rc.1';
+          const path = 'package-lock.json';
+          const lock = JSON.parse(fs.readFileSync(path, 'utf8'));
+          lock.version = version;
+          if (!lock.packages || !lock.packages['']) {
+            throw new Error('package-lock.json is missing packages[""]');
+          }
+          lock.packages[''].version = version;
+          fs.writeFileSync(path, `${JSON.stringify(lock, null, 2)}\n`);
+          NODE
+
+      - name: Synchronize Rust lock metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path('src-tauri/Cargo.lock')
+          text = path.read_text(encoding='utf-8')
+          old = 'name = "codex-app-manager"\nversion = "0.5.2"'
+          new = 'name = "codex-app-manager"\nversion = "0.5.3-rc.1"'
+          count = text.count(old)
+          if count != 1:
+              raise SystemExit(f'expected exactly one codex-app-manager 0.5.2 lock entry, found {count}')
+          path.write_text(text.replace(old, new), encoding='utf-8')
+          PY
+
+      - name: Verify all six source versions
+        shell: bash
+        run: node scripts/check-release-version.mjs v0.5.3-rc.1
+
+      - name: Commit synchronized lockfiles
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- package-lock.json src-tauri/Cargo.lock; then
+            echo "Lockfiles already synchronized."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package-lock.json src-tauri/Cargo.lock
+          git commit -m "chore(release): sync v0.5.3-rc.1 lockfiles"
+          git push origin HEAD:release/v0.5.3-rc.1
